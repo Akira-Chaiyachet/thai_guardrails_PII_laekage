@@ -1,0 +1,5 @@
+presidio-analyzer
+fastapi
+uvicorn
+pydantic
+pytest
