@@ -3,7 +3,7 @@ import re
 from typing import List, Dict, Optional
 from src.core.utils import verify_thai_id
 from transformers import pipeline
-
+from src.core.utils import verify_thai_id
 # เช็คว่ามี AttaCut ไหม
 try:
     from attacut import tokenize as attacut_tokenize
@@ -153,9 +153,9 @@ class PII_Detector:
                 findings.append({"type": "PHONE_NUMBER", "value": match.group(), "start": match.start(), "end": match.end(), "score": 1.0})
         for match in self.id_card_pattern.finditer(text):
             candidate = match.group()
+            # 👇 ตรงนี้แหละครับที่มันเรียกใช้สูตรคำนวณ
             if verify_thai_id(candidate) and not self._check_context(text, match.start(), match.end()) and not self._is_overlap(match.start(), match.end(), findings):
                 findings.append({"type": "THAI_ID", "value": candidate, "start": match.start(), "end": match.end(), "score": 1.0})
-
         # 4. AI
         try:
             padded_text = " " + text 
