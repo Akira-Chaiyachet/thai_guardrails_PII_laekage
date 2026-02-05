@@ -1,73 +1,302 @@
 # src/core/detectors.py
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from src.core.utils import verify_thai_id
+from transformers import pipeline
+
+# เช็คว่ามี AttaCut ไหม
+try:
+    from attacut import tokenize as attacut_tokenize
+    USING_ATTACUT = True
+    print("✅ Using AttaCut (AI Tokenizer)")
+except ImportError:
+    from pythainlp import word_tokenize
+    USING_ATTACUT = False
+    print("⚠️ AttaCut not found, using PyThaiNLP (NewMM)")
 
 class PII_Detector:
     def __init__(self):
-        # 1. อัปเกรด Regex เบอร์โทร: รองรับ +66, 66 หรือ 0 นำหน้า
+        # 1. Hard Rules (Regex)
         self.phone_pattern = re.compile(r'(\+66|66|0)[689]\d{8}')
-        
         self.id_card_pattern = re.compile(r'\d{13}')
-
-        # คำที่บ่งบอกว่า "ไม่ใช่" บัตรประชาชน (False Positive Indicators)
-        # ถ้าเจอคำพวกนี้อยู่ "หลัง" ตัวเลข -> สันนิษฐานว่าเป็นเงิน
-        self.ignore_after = ["บาท", "สตางค์", "point", "แต้ม", "คะแนน"]
-        
-        # ถ้าเจอคำพวกนี้อยู่ "หน้า" ตัวเลข -> สันนิษฐานว่าเป็นราคาหรือรหัสอื่น
+        self.ignore_after = ["บาท", "สตางค์", "point", "แต้ม", "คะแนน", "คน"]
         self.ignore_before = ["ราคา", "ยอด", "ชำระ", "รวม", "หมายเลขตั๋ว", "รหัสจอง"]
 
-    def _check_context(self, text: str, start: int, end: int) -> bool:
-        """
-        ตรวจสอบบริบทแวดล้อม: คืนค่า True ถ้าคิดว่าเป็น False Positive (ไม่ควรจับ)
-        """
-        window_size = 15 # มองไปข้างหน้าและข้างหลัง 15 ตัวอักษร
+        # ---------------------------
+        # 2. Context Triggers
+        # ---------------------------
+        self.context_triggers = [
+            "ชื่อ", "นามสกุล", 
+            "นาย", "นาง", "นางสาว", "น.ส.", 
+            "เด็กชาย", "เด็กหญิง", "ด.ช.", "ด.ญ.", 
+            "พล.อ.", "พล.ต.อ.", "พ.ต.อ.", "ร.ต.อ.", 
+            "อาจารย์", "อ.", "ดร.", "ทนาย", "หมอ", "แพทย์", 
+            "ผู้ว่า", "กำนัน", "ผู้ใหญ่บ้าน"
+        ]
         
-        # 1. มองไปข้างหลัง (Look Ahead)
+        # ⛔ Forbidden Next Tokens: ถ้าคำถัดไปเป็นพวกนี้ "ห้ามจับ"
+        # (อัปเดตล่าสุด: เพิ่ม ปลัด, ด่าน, อดีต, อภัย, โทษ, แม่นาย, สโมสร, พระธาตุ, น้ำพริก)
+        self.forbidden_next_tokens = {
+            # ตำแหน่ง/อาชีพ/ยศ
+            "ตำรวจ", "ทหาร", "นายก", "อำเภอ", "ราชการ", "สาธารณสุข", 
+            "แพทย์", "พยาบาล", "ผู้", "ดาบ", "สิบ", "ช่าง", "ปลัด",
+            "สถานี", "กอง", "หมู่", "ตรวจ", "ด่าน", "ท่า", "ประกัน", "อดีต",
+            "จังหวัด", "เมือง", "ตำบล", "อบต", "เทศบาล", "เขต", "แขวง",
+            # เครือญาติ/คำเรียกทั่วไป
+            "พ่อ", "แม่", "ปู่", "ย่า", "ตา", "ยาย", "ลุง", "ป้า", "น้า", "อา",
+            "พี่", "น้อง", "ลูก", "หลาน", "ครู", "พระ", "เจ้า", "คน",
+            # สถานที่/สิ่งของ/คำสุภาพ
+            "วัด", "โรงเรียน", "บ้าน", "ร้าน", "ตลาด", "สำนัก", "สโมสร", "สวน",
+            "น้ำพริก", "ขนม", "อาหาร", "สินค้า", "พระธาตุ", "ห้วย", "ถ้ำ", "ปาก",
+            "อภัย", "โทษ", "แม่นาย"
+        }
+
+        # ⛔ Stop Words: เจอคำพวกนี้ให้ "ตัดจบชื่อ" ทันที
+        # (อัปเดตล่าสุด: เพิ่ม ยืน, ขอ, ต้องการ, ชื่อ, จน, ขาด, นะฮะ, ผูก, คอ, ส่ง)
+        self.stop_words = {
+             # คำลงท้าย/คำสร้อย
+             "ครับ", "ค่ะ", "นะ", "จ้ะ", "จ้า", "นี้", "นั้น", "นู้น", 
+             "เนี่ย", "อ่ะ", "หรอก", "เอง", "ด้วย", "ล่ะ", "สิ", "อือ", "อืม",
+             "บ้าง", "มั้ย", "ไหม", "เหรอ", "หนิ", "ไง", "เถอะ", "นะฮะ", "ฮะ",
+             
+             # คำเชื่อม/บุพบท
+             "ได้", "ที่", "แล้ว", "เลย", "ไม่", "มี", "เป็น", "คือ",
+             "ไป", "มา", "จะ", "ให้", "ของ", "ทาง", "การ", "ใน", "และ",
+             "กับ", "หรือ", "แต่", "ก็", "ซึ่ง", "โดย", "เพื่อ", "ว่า", "จน", "แบบ", "เช่น",
+             "ก่อน", "หลัง", "เมื่อ", "ตอน", "ช่วง", "ขณะ", "เดี๋ยว", "ระหว่าง",
+             
+             # คำนามทั่วไป
+             "อายุ", "วัย", "ปี", "ชาว", "ผู้", "คน", "ราย", "ศพ", "ญาติ", 
+             "ชื่อ", "นามสกุล", "ชื่อเล่น",
+             "หนึ่ง", "สอง", "สาม", "จำนวน", "แห่ง", "เอกซเรย์", "หัวใจ", "รูป", "ด่าน",
+             
+             # กริยา (Verbs) - ตัวการสำคัญ!
+             "ยืน", "นั่ง", "นอน", "เดิน", "วิ่ง", "จอด", "ปีน",
+             "ขอ", "ให้", "รับ", "ส่ง", "มอบ", "ยื่น", "โยน",
+             "ต้องการ", "อยาก", "ชอบ", "รัก", "เกลียด", "กลัว", "แกล้ง",
+             "ขาด", "เกิน", "เหลือ", "พอ",
+             "ให้การ", "รับสารภาพ", "ปฏิเสธ", "ก่อเหตุ", "ลงมือ", "อ้าง",
+             "ขับ", "ขี่", "พา", "นำ",
+             "กล่าว", "บอก", "เผย", "แจ้ง", "ระบุ", "เล่า", "ถาม", "ตอบ", "คุย", "เคลียร์", "พูด",
+             "ทราบ", "แถลง", "ตรง", "จุด", "อัน",
+             "หนี", "หลบหนี", "มอบตัว", "จับ", "รวบ", "คุม", "ขัง", "ย้อน", "กลับ", "คืน",
+             "โดน", "ถูก", "ยิง", "แทง", "ฆ่า", "ทำร้าย", "ชก", "ตบ", "ตี", "ฟัน", "ต่อสู้", "ขัดขืน",
+             "เห็น", "มอง", "ดู", "เจอ", "พบ", "สังเกต", 
+             "ผุด", "สร้าง", "ทำ", "มี", "ได้", "เสีย", "ตาย",
+             "สวม", "ใส่", "ถอด", "ยุ่ง", "ถ่าย", "ร้าย", "ผูก", "คอ"
+        }
+
+        # ⛔ Compound Blacklist
+        self.ignore_compounds = [
+            "นายก", "นายอำเภอ", "นายหน้า", "นายจ้าง", "นายช่าง", 
+            "นายแบบ", "นายท่า", "นายด่าน", "นายกอง", "เจ้านาย", 
+            "นายตรวจ", "นายสถานี", "นายประกัน", "นายทะเบียน",
+            "นายตำรวจ", "นายร้อย", "นายสิบ", "นายดาบ", "นายพล", "นายทหาร", "นายแพทย์",
+            "นางฟ้า", "นางแบบ", "นางเอก", "นางรำ", "นางนวล", 
+            "นางงาม", "นางไม้", "นางพยาบาล", "นางยักษ์", "นางร้าย",
+            "นางสาวไทย", "นางสนม", "นางบำเรอ", "นางโลม",
+            "หมอชิต", "หมอลำ", "หมอหุง", "หมอผี", "หมอดู", "หมอความ",
+            "ทนายหน้าหอ", "ผู้ว่าจ้าง", "ผู้สื่อข่าว", "แม่นาย"
+        ]
+
+        self.custom_names = {
+            "เมย์", "ธนาทร", "สมชาย", "เจฟ", "ซาเตอร์", 
+            "ชาญเจริญยิ่ง", "มงคลคุณเพียร"
+        }
+
+        print("⏳ กำลังโหลดโมเดล AI (WangchanBERTa - LST20)...")
+        self.nlp_pipeline = pipeline(
+            "token-classification", 
+            model="thanaphatt1/WangchanBERTa-LST20",
+            aggregation_strategy="simple",
+            framework="pt"
+        )
+        print("✅ โหลดโมเดลเสร็จสิ้น!")
+
+        self.type_mapping = {"PER": "PERSON", "B_PER": "PERSON", "I_PER": "PERSON", "person": "PERSON"}
+        self.prefixes = ["นาย", "นาง", "นางสาว", "เด็กชาย", "เด็กหญิง", "ด.ช.", "ด.ญ.", "คุณ", "ผม", "ดิฉัน", "ฉัน", "กระผม", "พี่", "น้า", "อา", "ลุง", "ป้า"]
+        self.prefixes.sort(key=len, reverse=True)
+
+    def _check_context(self, text: str, start: int, end: int) -> bool:
+        window_size = 15
         post_text = text[end : min(len(text), end + window_size)]
         for keyword in self.ignore_after:
-            if keyword in post_text:
-                return True # เจอคำว่า "บาท" -> ตัดทิ้งเลย
-                
-        # 2. มองไปข้างหน้า (Look Behind)
+            if keyword in post_text: return True
         pre_text = text[max(0, start - window_size) : start]
         for keyword in self.ignore_before:
-            if keyword in pre_text:
-                return True # เจอคำว่า "ราคา" -> ตัดทิ้งเลย
-                
+            if keyword in pre_text: return True
         return False
 
     def detect(self, text: str) -> List[Dict]:
         findings = []
 
-        # --- ตรวจจับเบอร์โทรศัพท์ ---
-        for match in self.phone_pattern.finditer(text):
-            findings.append({
-                "type": "PHONE_NUMBER",
-                "value": match.group(),
-                "start": match.start(),
-                "end": match.end(),
-                "score": 1.0
-            })
+        # 1. Dictionary
+        for name in self.custom_names:
+            pattern = re.compile(re.escape(name), re.IGNORECASE)
+            for match in pattern.finditer(text):
+                findings.append({"type": "PERSON", "value": match.group(), "start": match.start(), "end": match.end(), "score": 1.0})
 
-        # --- ตรวจจับเลขบัตรประชาชน ---
+        # 2. Context Rules
+        context_findings = self._detect_by_context(text)
+        for cf in context_findings:
+            if not self._is_overlap(cf['start'], cf['end'], findings):
+                findings.append(cf)
+
+        # 3. Hard Rules
+        for match in self.phone_pattern.finditer(text):
+            if not self._is_overlap(match.start(), match.end(), findings):
+                findings.append({"type": "PHONE_NUMBER", "value": match.group(), "start": match.start(), "end": match.end(), "score": 1.0})
         for match in self.id_card_pattern.finditer(text):
             candidate = match.group()
+            if verify_thai_id(candidate) and not self._check_context(text, match.start(), match.end()) and not self._is_overlap(match.start(), match.end(), findings):
+                findings.append({"type": "THAI_ID", "value": candidate, "start": match.start(), "end": match.end(), "score": 1.0})
+
+        # 4. AI
+        try:
+            padded_text = " " + text 
+            ai_results = self.nlp_pipeline(padded_text)
+        except:
+            ai_results = []
+
+        for item in ai_results:
+            raw_tag = item.get('entity_group') or item.get('entity')
+            start = max(0, item['start'] - 1) 
+            end = max(0, item['end'] - 1)
+            score = item['score']
+
+            my_type = self.type_mapping.get(raw_tag)
+            if not my_type or my_type != "PERSON": continue
+            if self._is_overlap(start, end, findings): continue
             
-            # Step A: ตรวจสอบสูตรคณิตศาสตร์ (Check Digit)
-            if not verify_thai_id(candidate):
-                continue # สูตรผิด -> ไม่ใช่บัตรแน่ๆ
+            real_word = text[start:end]
+            blacklist_ai = ["ตำบล", "อำเภอ", "จังหวัด", "วัด", "โรงเรียน", "บ้าน", "ถนน", "ซอย", "น้ำพริก", "สำนัก", "สโมสร", "พระธาตุ", "ห้วย", "สวน"]
+            if any(x in real_word for x in blacklist_ai): continue
 
-            # Step B: ตรวจสอบบริบท (Context Check) - *Logic ใหม่*
-            if self._check_context(text, match.start(), match.end()):
-                continue # บริบทบอกว่าเป็นเงิน/ราคา -> ข้ามไป ไม่จับ
+            cleaned_entity = self._process_entity(real_word, start, my_type, score)
+            if cleaned_entity:
+                cleaned_entity['end'] = cleaned_entity['start'] + len(cleaned_entity['value'])
+                findings.append(cleaned_entity)
 
-            findings.append({
-                "type": "THAI_ID",
-                "value": candidate,
-                "start": match.start(),
-                "end": match.end(),
-                "score": 1.0
-            })
-        
         return sorted(findings, key=lambda x: x['start'])
+
+    def _detect_by_context(self, text: str) -> List[Dict]:
+        results = []
+        
+        for trigger in self.context_triggers:
+            for match in re.finditer(re.escape(trigger), text):
+                trigger_start = match.start()
+                trigger_end = match.end()
+
+                # Check 1: ตัวเลขนำหน้า
+                pre_chunk = text[max(0, trigger_start-10) : trigger_start].strip()
+                if pre_chunk and pre_chunk[-1].isdigit(): continue
+
+                # Check 2: Blacklist คำซ้อน
+                check_window = text[trigger_start : trigger_start + 25]
+                is_ignored = False
+                for compound in self.ignore_compounds:
+                    if check_window.startswith(compound):
+                        is_ignored = True
+                        break
+                if is_ignored: continue
+
+                # Tokenize
+                remaining_text = text[trigger_end:]
+                offset = 0
+                while offset < len(remaining_text) and remaining_text[offset].isspace():
+                    offset += 1
+                target_text = remaining_text[offset:]
+                if not target_text: continue
+
+                if USING_ATTACUT:
+                    tokens = attacut_tokenize(target_text)
+                else:
+                    from pythainlp import word_tokenize
+                    tokens = word_tokenize(target_text, engine="newmm")
+
+                if not tokens: continue
+
+                # 🛠️ Fix Special Case: นาง + สาว -> นางสาว (ต้องขยับ Offset!)
+                first_token = tokens[0]
+                extra_offset = 0  # ตัวแปรสำคัญสำหรับแก้บั๊ก "นาง...ทร์"
+                
+                if trigger == "นาง" and first_token == "สาว":
+                    if len(tokens) > 1:
+                        extra_offset = len(first_token) # จำไว้ว่าข้ามไปกี่ตัวอักษร
+                        tokens = tokens[1:] 
+                        first_token = tokens[0]
+                    else: continue
+
+                # Check 3: Forbidden Next Tokens
+                is_forbidden = False
+                for forbidden in self.forbidden_next_tokens:
+                    if forbidden in first_token: 
+                        is_forbidden = True
+                        break
+                if is_forbidden: continue
+                
+                if len(first_token) < 2: continue
+
+                # --- MERGE LOGIC ---
+                full_name_parts = []
+                for token in tokens:
+                    if token in self.stop_words: break
+                    
+                    if "อายุ" in token: 
+                        token = token.split("อายุ")[0]
+                        if token: full_name_parts.append(token)
+                        break
+                    
+                    if not any(c.isalnum() for c in token) and not token.isspace(): break
+                    if any(c.isdigit() for c in token): break
+                    
+                    if any(f in token for f in self.forbidden_next_tokens): break
+                    
+                    if len(full_name_parts) >= 8: break # Limit 8
+                    
+                    full_name_parts.append(token)
+
+                if not full_name_parts: continue
+                
+                final_name = "".join(full_name_parts).strip()
+                
+                if len(final_name) < 2: continue
+                
+                # Final Filtering
+                if final_name in ["สาว", "ชาย", "หญิง", "มานะ", "เดินทาง", "เสียชีวิต", "บาดเจ็บ", "เกิดเหตุ", "ขอ", "อภัย"]:
+                    continue
+
+                # ✅ คำนวณตำแหน่งจริง: Trigger + Space + (คำว่า 'สาว' ถ้ามี)
+                real_start = trigger_end + offset + extra_offset
+                real_end = real_start + len(final_name)
+
+                results.append({
+                    "type": "PERSON",
+                    "value": final_name,
+                    "start": real_start,
+                    "end": real_end,
+                    "score": 0.98
+                })
+                
+        return results
+
+    def _is_overlap(self, start, end, current_findings):
+        for f in current_findings:
+            if (start < f['end']) and (end > f['start']):
+                return True
+        return False
+
+    def _process_entity(self, entity_text: str, start_index: int, entity_type: str, score: float) -> Optional[Dict]:
+        while True:
+            found_prefix = False
+            for prefix in self.prefixes:
+                if entity_text.startswith(prefix):
+                    cut_len = len(prefix)
+                    entity_text = entity_text[cut_len:].lstrip()
+                    start_index += cut_len
+                    found_prefix = True
+                    break
+            if not found_prefix: break
+        
+        if len(entity_text) < 2: return None
+        return {"type": entity_type, "value": entity_text, "start": start_index, "score": float(score)}
